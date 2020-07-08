@@ -45,6 +45,92 @@ class VNCSession(object):
     def __repr__(self):
         return f"  {self.name:12s} {self.display:5s} {self.desktop:s}"
 
+
+##-------------------------------------------------------------------------
+## Define SSH Tunnel Object
+##-------------------------------------------------------------------------
+class SSHTunnel(object):
+    '''An object to contain information about an SSH tunnel.
+    '''
+    def __init__(self, server, username, ssh_pkey, remote_port, local_port,
+                         session_name='unknown', ssh_additional_kex=None):
+        self.log = logging.getLogger('KRO')
+        self.server = server
+        self.username = username
+        self.ssh_pkey = ssh_pkey
+        self.remote_port = remote_port
+        self.local_port = local_port
+        self.session_name = session_name
+        self.remote_connection = f'{username}@{server}:{remote_port}'
+        self.ssh_additional_kex = ssh_additional_kex
+
+        address_and_port = f"{username}@{server}:{remote_port}"
+        self.log.info(f"Opening SSH tunnel for {address_and_port} "
+                         f"on local port {local_port}.")
+
+        # We now know everything we need to know in order to establish the
+        # tunnel. Build the command line options and start the child process.
+        # The -N and -T options below are somewhat exotic: they request that
+        # the login process not execute any commands and that the server does
+        # not allocate a pseudo-terminal for the established connection.
+
+        forwarding = f"{local_port}:localhost:{remote_port}"
+        cmd = ['ssh', server, '-l', username, '-L', forwarding, '-N', '-T']
+        cmd.append('-oStrictHostKeyChecking=no')
+        cmd.append('-oCompression=yes')
+
+        if self.ssh_additional_kex is not None:
+            cmd.append('-oKexAlgorithms=' + self.ssh_additional_kex)
+
+        if ssh_pkey is not None:
+            cmd.append('-i')
+            cmd.append(ssh_pkey)
+
+        self.command = ' '.join(cmd)
+        self.log.debug(f'ssh command: {self.command}')
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+
+        # Having started the process let's make sure it's actually running.
+        # First try polling,  then confirm the requested local port is in use.
+        # It's a fatal error if either check fails.
+
+        if self.proc.poll() is not None:
+            raise RuntimeError('subprocess failed to execute ssh')
+
+        # A delay is built-in here as it takes some finite amount of time for
+        # ssh to establish the tunnel. 50 checks with a 0.1 second sleep between
+        # checks is effectively a five second timeout.
+
+        checks = 50
+        while checks > 0:
+            result = is_local_port_in_use(local_port)
+            if result == True:
+                break
+            elif self.proc.poll() is not None:
+                raise RuntimeError('ssh command exited unexpectedly')
+
+            checks -= 1
+            time.sleep(0.1)
+
+        if checks == 0:
+            raise RuntimeError('ssh tunnel failed to open after 5 seconds')
+
+
+    def close(self):
+        '''Close this SSH tunnel
+        '''
+        self.log.info(f" Closing SSH tunnel for local port {self.local_port}: {self.session_name}")
+        self.proc.kill()
+
+
+    def __str__(self):
+        address_and_port = f"{self.username}@{self.server}:{self.remote_port}"
+        return f"SSH tunnel for {address_and_port} on local port {self.local_port}."
+
+
+
 class LickVncLauncher(object):
     '''Fundamental object for starting, managing and closing VNC sessions to Lick.
     The object has a number of methods but the basic construction should look like
@@ -279,7 +365,7 @@ class LickVncLauncher(object):
             #open ssh tunnel
             if local_port is None:
                 try:
-                    local_port = self.open_ssh_tunnel(vncserver, account, password,
+                    tunnel = self.open_ssh_tunnel(vncserver, account, password,
                                                     self.ssh_pkey, port, None,
                                                     session_name=session_name)
                 except:
@@ -290,7 +376,7 @@ class LickVncLauncher(object):
                     return
                 vncserver = 'localhost'
         else:
-            local_port = port
+            local_port = tunnel.local_port
 
 
 
@@ -525,14 +611,15 @@ class LickVncLauncher(object):
         Lists the tunnels, handy for understanding why a VNC window or
         a soundplay connection dissappeared.
         '''
-        if len(self.ports_in_use) == 0:
+        if len(self.ssh_tunnels) == 0:
             print(f"No SSH tunnels opened by this program")
         else:
             print(f"\nSSH tunnels:")
             print(f"  Local Port | Desktop   | Remote Connection")
-            for p in self.ports_in_use.keys():
-                desktop = self.ports_in_use[p][1]
-                remote_connection = self.ports_in_use[p][0]
+            for p in self.ssh_tunnels.keys():
+                tunnel = self.ssh_tunnels[p]
+                desktop = tunnel.session_name
+                remote_connection = tunnel.remote_connection
                 print(f"  {p:10d} | {desktop:9s} | {remote_connection:s}")
 
 
@@ -580,51 +667,11 @@ class LickVncLauncher(object):
             self.local_port = self.LOCAL_PORT_START
             return False
 
-        #log
-        address_and_port = f"{username}@{server}:{remote_port}"
-        self.log.info(f"Opening SSH tunnel for {address_and_port} "
-                 f"on local port {local_port}.")
+        tunnel = SSHTunnel(server, username, ssh_pkey, remote_port, local_port,
+                    session_name=session_name, ssh_additional_kex=self.ssh_additional_kex)
 
-        # build the command
-        forwarding = f"{local_port}:localhost:{remote_port}"
-        command = ['ssh', '-l', username, '-L', forwarding, '-N', '-T', server]
-        command.append('-oStrictHostKeyChecking=no')
-        command.append('-oCompression=yes')
-        if self.ssh_additional_kex is not None:
-            command.append('-oKexAlgorithms=' + self.ssh_additional_kex)
-
-        if ssh_pkey is not None:
-            command.append('-i')
-            command.append(ssh_pkey)
-
-        self.log.debug('ssh command: ' + ' '.join (command))
-        null = subprocess.DEVNULL
-        proc = subprocess.Popen(command,stdin=null,stdout=null,stderr=null)
-
-
-        # Having started the process let's make sure it's actually running.
-        # First try polling,  then confirm the requested local port is in use.
-        # It's a fatal error if either check fails.
-
-        if proc.poll() is not None:
-            raise RuntimeError('subprocess failed to execute ssh')
-
-        checks = 50
-        while checks > 0:
-            result = self.is_local_port_in_use(local_port)
-            if result == True:
-                break
-            else:
-                checks -= 1
-                time.sleep(0.1)
-
-        if checks == 0:
-            raise RuntimeError('ssh tunnel failed to open after 5 seconds')
-
-        in_use = [address_and_port, session_name, proc]
-        self.ports_in_use[local_port] = in_use
-
-        return local_port
+        self.ssh_tunnels[local_port] = tunnel
+        return tunnel
 
 
     ##-------------------------------------------------------------------------
@@ -1118,9 +1165,9 @@ class LickVncLauncher(object):
         Closes ssh session on port p.
 
         '''
-        if p in self.ports_in_use.keys():
+        if p in self.ssh_tunnels.keys():
             try:
-                remote_connection, desktop, process = self.ports_in_use.pop(p, None)
+                ssh_tunnels[p].close()
             except KeyError:
                 return
 
